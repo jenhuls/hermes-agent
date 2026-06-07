@@ -999,17 +999,28 @@ class APIServerAdapter(BasePlatformAdapter):
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = model_override or _resolve_gateway_model()
 
-        # Route DeepSeek models directly to the DeepSeek API instead of
-        # the default provider (OpenRouter). All other models use the
-        # configured provider unchanged.
-        if model_override and model_override.startswith("deepseek-"):
-            deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
-            runtime_kwargs.update({
-                "provider": "openai",
-                "base_url": "https://api.deepseek.com/v1",
-                "api_key": deepseek_key,
-                "api_mode": "chat_completions",
-            })
+        # Route models to their direct providers, bypassing the default
+        # configured provider (OpenRouter). Unrecognised model strings
+        # fall through unchanged so the gateway default applies.
+        if model_override:
+            if model_override.startswith("deepseek-"):
+                runtime_kwargs.update({
+                    "provider": "openai",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "api_key": os.getenv("DEEPSEEK_API_KEY", ""),
+                    "api_mode": "chat_completions",
+                    "command": None,
+                    "args": [],
+                })
+            elif model_override.startswith("claude-"):
+                runtime_kwargs.update({
+                    "provider": "anthropic",
+                    "base_url": "",
+                    "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
+                    "api_mode": "anthropic_messages",
+                    "command": None,
+                    "args": [],
+                })
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
