@@ -1021,6 +1021,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "command": None,
                     "args": [],
                 })
+            elif model_override == "openai-codex" or model_override.startswith("codex-"):
+                from hermes_cli.auth import resolve_codex_runtime_credentials
+                creds = resolve_codex_runtime_credentials()
+                model = model_override if model_override.startswith("codex-") else "gpt-5.4"
+                runtime_kwargs.update({
+                    "provider": creds["provider"],
+                    "base_url": creds["base_url"],
+                    "api_key": creds["api_key"],
+                    "api_mode": "codex_responses",
+                    "command": None,
+                    "args": [],
+                })
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -1102,6 +1114,119 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+    async def _handle_auth_codex_start(self, request: "web.Request") -> "web.Response":
+        """POST /v1/auth/codex/start — begin Codex device code login flow."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        import httpx as _httpx
+        from hermes_cli.auth import CODEX_OAUTH_CLIENT_ID as _CODEX_CLIENT_ID
+        issuer = "https://auth.openai.com"
+        try:
+            async with _httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{issuer}/api/accounts/deviceauth/usercode",
+                    json={"client_id": _CODEX_CLIENT_ID},
+                    headers={"Content-Type": "application/json"},
+                )
+            if resp.status_code != 200:
+                return web.json_response(
+                    {"error": f"device_code_request_failed", "detail": f"HTTP {resp.status_code}"},
+                    status=502,
+                )
+            data = resp.json()
+            user_code = data.get("user_code", "")
+            device_auth_id = data.get("device_auth_id", "")
+            interval = max(3, int(data.get("interval", 5)))
+            if not user_code or not device_auth_id:
+                return web.json_response({"error": "device_code_incomplete"}, status=502)
+            return web.json_response({
+                "user_code": user_code,
+                "device_auth_id": device_auth_id,
+                "interval": interval,
+                "verification_url": f"{issuer}/codex/device",
+            })
+        except Exception as exc:
+            return web.json_response({"error": "device_code_request_error", "detail": str(exc)}, status=502)
+
+    async def _handle_auth_codex_poll(self, request: "web.Request") -> "web.Response":
+        """POST /v1/auth/codex/poll — poll one step of the device code exchange.
+
+        Body: { "device_auth_id": "...", "user_code": "..." }
+        Returns: { "status": "pending" | "complete" | "expired" }
+        On "complete", tokens are saved to the Hermes auth store.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        device_auth_id = body.get("device_auth_id", "")
+        user_code = body.get("user_code", "")
+        if not device_auth_id or not user_code:
+            return web.json_response({"error": "missing_fields"}, status=400)
+
+        import httpx as _httpx
+        from hermes_cli.auth import (
+            CODEX_OAUTH_CLIENT_ID as _CODEX_CLIENT_ID,
+            CODEX_OAUTH_TOKEN_URL as _CODEX_TOKEN_URL,
+            DEFAULT_CODEX_BASE_URL as _CODEX_BASE_URL,
+            _save_codex_tokens,
+        )
+        from datetime import datetime, timezone as _tz
+        issuer = "https://auth.openai.com"
+        try:
+            async with _httpx.AsyncClient(timeout=15.0) as client:
+                poll_resp = await client.post(
+                    f"{issuer}/api/accounts/deviceauth/token",
+                    json={"device_auth_id": device_auth_id, "user_code": user_code},
+                    headers={"Content-Type": "application/json"},
+                )
+        except Exception as exc:
+            return web.json_response({"error": "poll_request_failed", "detail": str(exc)}, status=502)
+
+        if poll_resp.status_code in {403, 404}:
+            return web.json_response({"status": "pending"})
+        if poll_resp.status_code != 200:
+            return web.json_response({"status": "expired", "detail": f"HTTP {poll_resp.status_code}"})
+
+        code_data = poll_resp.json()
+        authorization_code = code_data.get("authorization_code", "")
+        code_verifier = code_data.get("code_verifier", "")
+        if not authorization_code or not code_verifier:
+            return web.json_response({"status": "expired", "detail": "missing exchange fields"})
+
+        try:
+            async with _httpx.AsyncClient(timeout=15.0) as client:
+                token_resp = await client.post(
+                    _CODEX_TOKEN_URL,
+                    data={
+                        "grant_type": "authorization_code",
+                        "code": authorization_code,
+                        "redirect_uri": f"{issuer}/deviceauth/callback",
+                        "client_id": _CODEX_CLIENT_ID,
+                        "code_verifier": code_verifier,
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+        except Exception as exc:
+            return web.json_response({"status": "expired", "detail": str(exc)})
+
+        if token_resp.status_code != 200:
+            return web.json_response({"status": "expired", "detail": f"token exchange HTTP {token_resp.status_code}"})
+
+        tokens = token_resp.json()
+        access_token = tokens.get("access_token", "")
+        refresh_token = tokens.get("refresh_token", "")
+        if not access_token:
+            return web.json_response({"status": "expired", "detail": "no access_token in response"})
+
+        last_refresh = datetime.now(_tz.utc).isoformat().replace("+00:00", "Z")
+        _save_codex_tokens({"access_token": access_token, "refresh_token": refresh_token}, last_refresh)
+        return web.json_response({"status": "complete"})
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -1113,10 +1238,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        def _codex_available() -> bool:
+            try:
+                from hermes_cli.auth import resolve_codex_runtime_credentials
+                creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+                return bool(creds.get("api_key"))
+            except Exception:
+                return False
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
             "model": self._model_name,
+            "providers": {
+                "anthropic": bool(os.getenv("ANTHROPIC_API_KEY")),
+                "deepseek": bool(os.getenv("DEEPSEEK_API_KEY")),
+                "openai_codex": _codex_available(),
+            },
             "auth": {
                 "type": "bearer",
                 "required": bool(self._api_key),
@@ -4165,6 +4303,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_post("/v1/auth/codex/start", self._handle_auth_codex_start)
+            self._app.router.add_post("/v1/auth/codex/poll", self._handle_auth_codex_poll)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
