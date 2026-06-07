@@ -974,6 +974,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        model_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -996,7 +997,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
+        model = model_override or _resolve_gateway_model()
+
+        # Route DeepSeek models directly to the DeepSeek API instead of
+        # the default provider (OpenRouter). All other models use the
+        # configured provider unchanged.
+        if model_override and model_override.startswith("deepseek-"):
+            deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
+            runtime_kwargs.update({
+                "provider": "openai",
+                "base_url": "https://api.deepseek.com/v1",
+                "api_key": deepseek_key,
+                "api_mode": "chat_completions",
+            })
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -3685,6 +3698,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
+                    model_override=body.get("model") or None,
                 )
                 self._active_run_agents[run_id] = agent
 
